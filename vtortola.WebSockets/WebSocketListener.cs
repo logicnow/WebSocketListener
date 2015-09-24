@@ -80,10 +80,10 @@ namespace vtortola.WebSockets
         }
         private void ConfigureSocket(Socket client)
         {
-            if(_options.UseNagleAlgorithm.HasValue)
-                client.NoDelay = !_options.UseNagleAlgorithm.Value;
-            client.SendTimeout = (Int32)Math.Round(_options.WebSocketSendTimeout.TotalMilliseconds);
-            client.ReceiveTimeout = (Int32)Math.Round(_options.WebSocketReceiveTimeout.TotalMilliseconds);
+            //if(_options.UseNagleAlgorithm.HasValue)
+            //    client.NoDelay = !_options.UseNagleAlgorithm.Value;
+            //client.SendTimeout = (Int32)Math.Round(_options.WebSocketSendTimeout.TotalMilliseconds);
+            //client.ReceiveTimeout = (Int32)Math.Round(_options.WebSocketReceiveTimeout.TotalMilliseconds);
         }
 
         public async Task<WebSocket> AcceptWebSocketAsync(CancellationToken token)

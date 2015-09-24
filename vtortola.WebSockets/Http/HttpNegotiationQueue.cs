@@ -9,7 +9,7 @@ using System.Threading.Tasks.Dataflow;
 
 namespace vtortola.WebSockets.Http
 {
-    public sealed class HttpNegotiationQueue:IDisposable
+    public sealed class HttpNegotiationQueue : IDisposable
     {
         readonly BufferBlock<Socket> _sockets;
         readonly BufferBlock<WebSocketNegotiationResult> _negotiations;
@@ -17,22 +17,22 @@ namespace vtortola.WebSockets.Http
         readonly WebSocketHandshaker _handShaker;
         readonly WebSocketListenerOptions _options;
         readonly WebSocketConnectionExtensionCollection _extensions;
-        readonly SemaphoreSlim _semaphore;
+        private Action _startNextRequestAsync;
+        private int _currentOutstandingAccepts;
+        private int _currentOutstandingRequests;
 
         public HttpNegotiationQueue(WebSocketFactoryCollection standards, WebSocketConnectionExtensionCollection extensions, WebSocketListenerOptions options)
         {
             _options = options;
             _extensions = extensions;
             _cancel = new CancellationTokenSource();
-            _semaphore = new SemaphoreSlim(options.ParallelNegotiations);
-            
-            _sockets = new BufferBlock<Socket>(new DataflowBlockOptions()
-            {
+            _startNextRequestAsync = new Action(ProcessRequestsAsync);
+
+            _sockets = new BufferBlock<Socket>(new DataflowBlockOptions() {
                 BoundedCapacity = options.NegotiationQueueCapacity,
                 CancellationToken = _cancel.Token
             });
-            _negotiations = new BufferBlock<WebSocketNegotiationResult>(new DataflowBlockOptions()
-            {
+            _negotiations = new BufferBlock<WebSocketNegotiationResult>(new DataflowBlockOptions() {
                 BoundedCapacity = options.NegotiationQueueCapacity,
                 CancellationToken = _cancel.Token,
             });
@@ -42,28 +42,55 @@ namespace vtortola.WebSockets.Http
 
             _handShaker = new WebSocketHandshaker(standards, _options);
 
-            Task.Run((Func<Task>)WorkAsync);
+            OffloadStartNextRequest();
         }
 
-        private async Task WorkAsync()
+        private bool CanAcceptMoreRequests
         {
-            while (!_cancel.IsCancellationRequested)
+            get
             {
+                return (_currentOutstandingAccepts < _options.ParallelNegotiations
+                    && _currentOutstandingRequests < _options.NegotiationQueueCapacity - _currentOutstandingAccepts);
+            }
+        }
+
+        private void OffloadStartNextRequest()
+        {
+            if (!_cancel.IsCancellationRequested && CanAcceptMoreRequests)
+            {
+                Task.Factory.StartNew(_startNextRequestAsync);
+            }
+        }
+
+
+        private async void ProcessRequestsAsync()
+        {
+            while (!_cancel.IsCancellationRequested && CanAcceptMoreRequests)
+            {
+                Interlocked.Increment(ref _currentOutstandingAccepts);
+
+                Socket socket = null;
                 try
                 {
-                    await _semaphore.WaitAsync(_cancel.Token).ConfigureAwait(false);
-                    var socket = await _sockets.ReceiveAsync(_cancel.Token).ConfigureAwait(false);
-                    NegotiateWebSocket(socket);
+                    socket = await _sockets.ReceiveAsync(_cancel.Token).ConfigureAwait(false);
                 }
                 catch (TaskCanceledException)
                 {
                 }
                 catch (Exception)
                 {
-                    _cancel.Cancel();
+                    Interlocked.Decrement(ref _currentOutstandingAccepts);
+                    return;
                 }
+
+                Interlocked.Decrement(ref _currentOutstandingAccepts);
+                Interlocked.Increment(ref _currentOutstandingRequests);
+                OffloadStartNextRequest();
+
+                await NegotiateWebSocket(socket);
             }
         }
+
         private void FinishSocket(Socket client)
         {
             try { client.Dispose(); }
@@ -71,30 +98,15 @@ namespace vtortola.WebSockets.Http
         }
         private async Task NegotiateWebSocket(Socket client)
         {
-            await Task.Yield();
-
             WebSocketNegotiationResult result;
             try
             {
-                var timeoutTask = Task.Delay(_options.NegotiationTimeout);
-
                 Stream stream = new NetworkStream(client, FileAccess.ReadWrite, true);
                 foreach (var conExt in _extensions)
                 {
-                    var extTask = conExt.ExtendConnectionAsync(stream);
-                    await Task.WhenAny(timeoutTask, extTask).ConfigureAwait(false);
-                    if (timeoutTask.IsCompleted)
-                        throw new WebSocketException("Negotiation timeout (Extension: " + conExt.GetType().Name + ")");
-
-                    stream = await extTask;
+                    stream = await conExt.ExtendConnectionAsync(stream);
                 }
-
-                var handshakeTask = _handShaker.HandshakeAsync(stream);
-                await Task.WhenAny(timeoutTask, handshakeTask).ConfigureAwait(false);
-                if (timeoutTask.IsCompleted)
-                    throw new WebSocketException("Negotiation timeout");
-
-                var handshake = await handshakeTask;
+                var handshake = await _handShaker.HandshakeAsync(stream);
 
                 if (handshake.IsValid)
                     result = new WebSocketNegotiationResult(handshake.Factory.CreateWebSocket(stream, _options, (IPEndPoint)client.LocalEndPoint, (IPEndPoint)client.RemoteEndPoint, handshake.Request, handshake.Response, handshake.NegotiatedMessageExtensions));
@@ -104,7 +116,7 @@ namespace vtortola.WebSockets.Http
             catch (Exception ex)
             {
                 FinishSocket(client);
-                result= new WebSocketNegotiationResult(ExceptionDispatchInfo.Capture(ex));
+                result = new WebSocketNegotiationResult(ExceptionDispatchInfo.Capture(ex));
             }
             try
             {
@@ -112,7 +124,7 @@ namespace vtortola.WebSockets.Http
             }
             finally
             {
-                _semaphore.Release();
+                Interlocked.Decrement(ref _currentOutstandingRequests);
             }
         }
 
